@@ -1,16 +1,16 @@
-name: Ahr999指数监控系统（非小号版）
+name: 非小号Ahr999监控系统
 on:
   schedule:
-    - cron: '35 * * * *'  # 每小时第35分钟运行
+    - cron: '45 * * * *'  # 每小时第45分钟运行
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-    # ========== 系统环境准备 ==========
-    - name: 安装浏览器依赖
+    # ========== 浏览器环境配置 ==========
+    - name: 安装系统依赖
       run: |
         sudo apt-get update
         sudo apt-get install -y \
@@ -28,7 +28,7 @@ jobs:
           libgtk-3-0 \
           libgbm1
 
-    # ========== 非小号数据抓取 ==========
+    # ========== 数据抓取模块 ==========
     - name: 抓取非小号数据
       id: feixiaohao-crawler
       run: |
@@ -36,54 +36,76 @@ jobs:
         const fs = require('fs');
         const puppeteer = require('puppeteer');
 
-        (async () => {
-          const browser = await puppeteer.launch({
-            executablePath: '/usr/bin/chromium-browser',
-            args: [
-              '--no-sandbox',
-              '--disable-setuid-sandbox',
-              '--disable-dev-shm-usage',
-              '--lang=zh-CN'  // 中文环境避免反爬
-            ],
-            headless: 'new'  // 新版无头模式
-          });
+        async function fetchDataWithRetry(page, url, selector, retries = 3) {
+          for (let i = 0; i < retries; i++) {
+            try {
+              await page.goto(url, {
+                waitUntil: 'networkidle2',
+                timeout: 60000
+              });
+              await page.waitForSelector(selector, { timeout: 15000 });
+              const value = await page.\$eval(selector, el => {
+                return parseFloat(el.textContent.replace(/[^0-9.]/g, ''));
+              });
+              if (!isNaN(value)) return value;
+            } catch (e) {
+              console.log(\`第\${i+1}次尝试失败: \${e.message}\`);
+              await page.waitForTimeout(5000);  // 重试前等待
+            }
+          }
+          return null;
+        }
 
+        (async () => {
           try {
+            const browser = await puppeteer.launch({
+              executablePath: '/usr/bin/chromium-browser',
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+              ],
+              headless: 'new'
+            });
+
             const page = await browser.newPage();
           
-            // 模拟人类操作
+            // 反爬策略
             await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
             await page.setExtraHTTPHeaders({
               'Accept-Language': 'zh-CN,zh;q=0.9'
             });
 
-            // 访问非小号页面
-            await page.goto('https://www.feixiaohao.com/data/ahrdata.html', {
-              waitUntil: 'networkidle2',
-              timeout: 60000
-            });
+            // 获取数据 (带重试机制)
+            const value = await fetchDataWithRetry(
+              page,
+              'https://www.feixiaohao.com/data/ahrdata.html',
+              'div.price-box > div.val'
+            ) || await fetchDataWithRetry(
+              page,
+              'https://www.feixiaohao.com/data/ahrdata.html',
+              'div.coin-price > span.val'
+            );
 
-            // 等待数据加载
-            await page.waitForSelector('div.val', { timeout: 15000 });
-            await page.waitForTimeout(3000);  // 防止快速检测
-          
-            // 精准数据解析
-            const value = await page.evaluate(() => {
-              const element = document.querySelector('div.price-box > div.val');
-              return element ? parseFloat(element.textContent.replace(/[^\d.]/g, '')) : null;
-            });
-
-            // 写入输出变量
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, `ahr999_value=${value}`);
-          
-          } finally {
+            // 写入输出
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, \`ahr999_value=\${value}\`);
             await browser.close();
+
+            if (value === null) {
+              console.error('所有数据源均获取失败');
+              process.exit(1);
+            }
+
+          } catch (error) {
+            console.error('全局错误:', error);
+            process.exit(1);
           }
         })();
         EOF
 
-    # ========== 邮件通知系统 ==========
-    - name: 发送分级提醒
+    # ========== 邮件通知模块 ==========
+    - name: 发送提醒
       if: |
         steps.feixiaohao-crawler.outputs.ahr999_value != '' &&
         (steps.feixiaohao-crawler.outputs.ahr999_value <= 0.8 || steps.feixiaohao-crawler.outputs.ahr999_value >= 1.2)
@@ -95,37 +117,19 @@ jobs:
         python3 -c "
         import smtplib, os
         from email.mime.text import MIMEText
-        from email.header import Header
       
         value = ${{ steps.feixiaohao-crawler.outputs.ahr999_value }}
+        msg = MIMEText(f'当前Ahr999指数：{value:.4f}', 'plain', 'utf-8')
+        msg['Subject'] = '非小号监控提醒'
+        msg['From'] = os.environ['SMTP_USER']
+        msg['To'] = os.environ['RECEIVER_EMAIL']
       
-        # 构建邮件内容
-        if value <= 0.45:
-            title = '【紧急】Ahr999进入抄底区间'
-            content = f'''非小号数据：{value:.4f}
-            建议操作：
-            1. 立即使用50%资金买入
-            2. 剩余资金挂单0.45/0.40/0.35'''
-        elif value <= 0.8:
-            title = '【机会】Ahr999进入定投区间'
-            content = f'''非小号数据：{value:.4f}
-            建议操作：
-            1. 启动周定投计划
-            2. 每下跌0.1加仓20%'''
-        else:
-            title = '【风险】Ahr999进入高估区间'
-            content = f'''非小号数据：{value:.4f}
-            建议操作：
-            1. 分批卖出持仓
-            2. 保留10%底仓'''
-
-        # 邮件发送逻辑
-        msg = MIMEText(content, 'plain', 'utf-8')
-        msg['Subject'] = Header(title, 'utf-8').encode()
-        msg['From'] = Header('非小号监控系统', 'utf-8').encode() + f' <{os.environ["SMTP_USER"]}>'
-        msg['To'] = os.environ["RECEIVER_EMAIL"]
-
-        with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
-            server.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
-            server.sendmail(os.environ["SMTP_USER"], [os.environ["RECEIVER_EMAIL"]], msg.as_string())
+        try:
+            with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
+                server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+                server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], msg.as_string())
+            print('邮件发送成功')
+        except Exception as e:
+            print(f'邮件发送失败: {str(e)}')
+            exit(1)
         "
