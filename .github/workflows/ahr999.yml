@@ -1,4 +1,4 @@
-name: Ahr999监控系统
+name: Ahr999指数监控系统
 on:
   schedule:
     - cron: '30 * * * *'  # 每小时第30分钟运行
@@ -8,69 +8,86 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
+    # ========== 环境准备 ==========
     - name: 安装系统依赖
       run: |
         sudo apt-get update
         sudo apt-get install -y \
           chromium-browser \
-          libgbm-dev \
-          libxshmfence-dev \
           libnss3 \
           libatk1.0-0 \
-          libcups2 \
-          libdrm2 \
-          libxkbcommon0 \
+          libx11-xcb1 \
+          libxcb1 \
           libxcomposite1 \
           libxdamage1 \
-          libxrandr2
+          libxext6 \
+          libxfixes3 \
+          libxrandr2 \
+          libgbm1
 
-    - name: 设置Node.js环境
+    - name: 配置Node.js环境
       uses: actions/setup-node@v3
       with:
         node-version: 18
 
-    - name: 安装Puppeteer核心
-      run: npm install puppeteer
-
-    - name: 数据抓取
-      id: crawler
+    # ========== 数据抓取模块 ==========
+    - name: 获取指数数据
+      id: data-crawler
       run: |
         node <<EOF
+        const fs = require('fs');
         const puppeteer = require('puppeteer');
+
         (async () => {
           const browser = await puppeteer.launch({
             executablePath: '/usr/bin/chromium-browser',
-            args: [
-              '--no-sandbox',
-              '--disable-setuid-sandbox',
-              '--disable-dev-shm-usage'
-            ]
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
           });
-        
+
           try {
             const page = await browser.newPage();
-            await page.goto('https://www.feixiaohao.com/data/ahrdata.html', {
-              waitUntil: 'networkidle2',
-              timeout: 60000
-            });
           
-            // 精准元素定位
-            const value = await page.evaluate(() => {
-              const element = document.querySelector('div.price-box > div.val');
-              return element ? parseFloat(element.textContent.replace(/[^\d.]/g, '')) : null;
-            });
-          
-            console.log(`::set-output name=ahr999_value::${value}`);
+            // 尝试多个数据源
+            const sources = [
+              {
+                url: 'https://www.feixiaohao.com/data/ahrdata.html',
+                selector: 'div.val',
+                handler: text => parseFloat(text.replace(/[^0-9.]/g, ''))
+              },
+              {
+                url: 'https://ahr999.com',
+                selector: '#current_value',
+                handler: text => parseFloat(text.match(/\d+\.?\d*/)[0])
+              }
+            ];
+
+            let finalValue = null;
+            for (const source of sources) {
+              try {
+                await page.goto(source.url, {timeout: 60000});
+                await page.waitForSelector(source.selector, {timeout: 15000});
+                const text = await page.$eval(source.selector, el => el.textContent);
+                finalValue = source.handler(text);
+                break;
+              } catch (e) {}
+            }
+
+            // 写入输出变量
+            fs.appendFileSync(
+              process.env.GITHUB_OUTPUT, 
+              `ahr999_value=${finalValue}`
+            );
           } finally {
             await browser.close();
           }
         })();
         EOF
 
-    - name: 发送提醒
+    # ========== 通知模块 ==========
+    - name: 发送邮件提醒
       if: |
-        steps.crawler.outputs.ahr999_value != '' &&
-        (steps.crawler.outputs.ahr999_value <= 0.8 || steps.crawler.outputs.ahr999_value >= 1.2)
+        steps.data-crawler.outputs.ahr999_value != '' &&
+        (steps.data-crawler.outputs.ahr999_value <= 0.8 || steps.data-crawler.outputs.ahr999_value >= 1.2)
       env:
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
@@ -79,21 +96,34 @@ jobs:
         python3 -c "
         import smtplib, os
         from email.mime.text import MIMEText
+
+        value = ${{ steps.data-crawler.outputs.ahr999_value }}
       
-        value = ${{ steps.crawler.outputs.ahr999_value }}
-        if value <= 0.5:
-            msg = '🚨 极度低估！Ahr999指数：{:.4f}'.format(value)
+        # 分级内容模板
+        if value <= 0.45:
+            subject = '🚨 极度低估 (Ahr999=%.2f)' % value
+            content = '''建议立即行动：
+            - 使用50%资金抄底
+            - 剩余资金分3批挂单(0.45/0.40/0.35)'''
         elif value <= 0.8:
-            msg = '🚩 中度低估！Ahr999指数：{:.4f}'.format(value)
+            subject = '🚩 中度低估 (Ahr999=%.2f)' % value
+            content = '''建议操作：
+            - 启动周定投计划
+            - 每下跌0.1加仓20%'''
         else:
-            msg = '⚠️ 风险预警！Ahr999指数：{:.4f}'.format(value)
-      
-        message = MIMEText(msg, 'plain', 'utf-8')
-        message['Subject'] = 'Ahr999监控提醒'
-        message['From'] = os.environ['SMTP_USER']
-        message['To'] = os.environ['RECEIVER_EMAIL']
-      
+            subject = '⚠️ 风险预警 (Ahr999=%.2f)' % value
+            content = '''建议操作：
+            - 分批卖出(30%/50%/20%)
+            - 保留10%底仓'''
+
+        # 构建邮件
+        msg = MIMEText(content, 'plain', 'utf-8')
+        msg['Subject'] = subject
+        msg['From'] = f'监控系统 <{os.environ["SMTP_USER"]}>'
+        msg['To'] = os.environ["RECEIVER_EMAIL"]
+
+        # 发送邮件
         with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
-            server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
-            server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], message.as_string())
+            server.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"])
+            server.sendmail(os.environ["SMTP_USER"], [os.environ["RECEIVER_EMAIL"]], msg.as_string())
         "
