@@ -1,0 +1,144 @@
+name: Ahr999终极监控
+on:
+  schedule:
+    - cron: '20 * * * *'  # 每小时第20分钟运行（避开整点高峰）
+  workflow_dispatch:
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # 防止僵尸进程
+    steps:
+    # ========== 系统级依赖安装 ==========
+    - name: 安装Chromium全家桶
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          chromium-chromedriver \
+          chromium-browser \
+          fonts-liberation \
+          libu2f-udev \
+          fonts-noto-color-emoji
+      
+    # ========== 浏览器监控核心 ==========
+    - name: 智能数据抓取
+      id: crawler
+      uses: browser-actions/setup-puppeteer@v1.2.0
+      with:
+        args: |
+          const puppeteer = require('puppeteer-core');  // 使用稳定版核心
+          (async () => {
+            // 防崩溃配置
+            const browser = await puppeteer.launch({
+              executablePath: '/usr/bin/chromium-browser',
+              headless: 'new',
+              args: [
+                '--no-zygote',
+                '--no-sandbox',
+                '--disable-gpu',
+                '--disable-dev-shm-usage',
+                '--single-process',
+                '--js-flags=--max-old-space-size=512'
+              ],
+              timeout: 90000
+            });
+
+            try {
+              const page = await browser.newPage();
+              await page.setDefaultNavigationTimeout(120000);
+            
+              // ===== 多重数据源尝试 =====
+              const dataSources = [
+                {
+                  name: 'Feixiaohao',
+                  url: 'https://www.feixiaohao.com/data/ahrdata.html',
+                  selector: 'div.price-box > div.val',
+                  handler: el => parseFloat(el.textContent.replace(/[^\d.]/g, ''))
+                },
+                {
+                  name: 'Ahr999-Official',
+                  url: 'https://ahr999.com',
+                  selector: '#current_value',
+                  handler: el => {
+                    const text = el.textContent.match(/ahr999:\s*([\d.]+)/i);
+                    return text ? parseFloat(text[1]) : null;
+                  }
+                },
+                {
+                  name: 'BlockWander',
+                  url: 'https://blockwander.com/arh999-index/',
+                  selector: 'div.indicator-value',
+                  handler: el => parseFloat(el.textContent)
+                }
+              ];
+
+              let finalValue = null;
+              for (const source of dataSources) {
+                try {
+                  await page.goto(source.url, {
+                    waitUntil: 'networkidle0',
+                    timeout: 45000
+                  });
+                  await page.waitForSelector(source.selector, { timeout: 15000 });
+                  await page.waitForTimeout(2000);  // 反反爬延迟
+                
+                  const value = await page.$eval(
+                    source.selector,
+                    source.handler
+                  );
+                
+                  if (value && !isNaN(value)) {
+                    console.log(`数据源 ${source.name} 成功获取: ${value}`);
+                    finalValue = value;
+                    break;
+                  }
+                } catch (err) {
+                  console.log(`数据源 ${source.name} 失败: ${err.message}`);
+                }
+              }
+
+              if (finalValue !== null) {
+                console.log(`::set-output name=ahr999_value::${finalValue}`);
+              } else {
+                throw new Error('所有数据源均不可用');
+              }
+
+            } catch (error) {
+              console.log(`::error:: 全局错误 - ${error.message}`);
+              process.exit(2);  // 特殊退出码标识
+            } finally {
+              await browser.close();
+            }
+          })();
+
+    # ========== 智能通知系统 ==========
+    - name: 风险控制中心
+      if: |
+        always() && 
+        (steps.crawler.outcome == 'success' || steps.crawler.outcome == 'failure')
+      run: |
+        # 状态码解析
+        if [ "${{ steps.crawler.outcome }}" = "failure" ]; then
+          echo "::warning:: 数据抓取服务异常！"
+          python3 -c "
+          import smtplib, os
+          from email.mime.text import MIMEText
+        
+          msg = MIMEText('监控系统故障，请及时检查！', 'plain', 'utf-8')
+          msg['Subject'] = '🚨 监控系统告警'
+          msg['From'] = os.environ['SMTP_USER']
+          msg['To'] = os.environ['RECEIVER_EMAIL']
+        
+          with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
+              server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+              server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], msg.as_string())
+          "
+        elif [ "${{ steps.crawler.outputs.ahr999_value }}" ]; then
+          # 正常处理流程
+          VALUE=${{ steps.crawler.outputs.ahr999_value }}
+          # 分级策略...
+        fi
+      env:
+        SMTP_USER: ${{ secrets.SMTP_USER }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
