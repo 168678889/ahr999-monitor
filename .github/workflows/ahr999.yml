@@ -1,144 +1,99 @@
-name: Ahr999终极监控
+name: Ahr999监控系统
 on:
   schedule:
-    - cron: '20 * * * *'  # 每小时第20分钟运行（避开整点高峰）
+    - cron: '30 * * * *'  # 每小时第30分钟运行
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # 防止僵尸进程
     steps:
-    # ========== 系统级依赖安装 ==========
-    - name: 安装Chromium全家桶
+    - name: 安装系统依赖
       run: |
         sudo apt-get update
         sudo apt-get install -y \
-          chromium-chromedriver \
           chromium-browser \
-          fonts-liberation \
-          libu2f-udev \
-          fonts-noto-color-emoji
-      
-    # ========== 浏览器监控核心 ==========
-    - name: 智能数据抓取
-      id: crawler
-      uses: browser-actions/setup-puppeteer@v1.2.0
+          libgbm-dev \
+          libxshmfence-dev \
+          libnss3 \
+          libatk1.0-0 \
+          libcups2 \
+          libdrm2 \
+          libxkbcommon0 \
+          libxcomposite1 \
+          libxdamage1 \
+          libxrandr2
+
+    - name: 设置Node.js环境
+      uses: actions/setup-node@v3
       with:
-        args: |
-          const puppeteer = require('puppeteer-core');  // 使用稳定版核心
-          (async () => {
-            // 防崩溃配置
-            const browser = await puppeteer.launch({
-              executablePath: '/usr/bin/chromium-browser',
-              headless: 'new',
-              args: [
-                '--no-zygote',
-                '--no-sandbox',
-                '--disable-gpu',
-                '--disable-dev-shm-usage',
-                '--single-process',
-                '--js-flags=--max-old-space-size=512'
-              ],
-              timeout: 90000
-            });
+        node-version: 18
 
-            try {
-              const page = await browser.newPage();
-              await page.setDefaultNavigationTimeout(120000);
-            
-              // ===== 多重数据源尝试 =====
-              const dataSources = [
-                {
-                  name: 'Feixiaohao',
-                  url: 'https://www.feixiaohao.com/data/ahrdata.html',
-                  selector: 'div.price-box > div.val',
-                  handler: el => parseFloat(el.textContent.replace(/[^\d.]/g, ''))
-                },
-                {
-                  name: 'Ahr999-Official',
-                  url: 'https://ahr999.com',
-                  selector: '#current_value',
-                  handler: el => {
-                    const text = el.textContent.match(/ahr999:\s*([\d.]+)/i);
-                    return text ? parseFloat(text[1]) : null;
-                  }
-                },
-                {
-                  name: 'BlockWander',
-                  url: 'https://blockwander.com/arh999-index/',
-                  selector: 'div.indicator-value',
-                  handler: el => parseFloat(el.textContent)
-                }
-              ];
+    - name: 安装Puppeteer核心
+      run: npm install puppeteer
 
-              let finalValue = null;
-              for (const source of dataSources) {
-                try {
-                  await page.goto(source.url, {
-                    waitUntil: 'networkidle0',
-                    timeout: 45000
-                  });
-                  await page.waitForSelector(source.selector, { timeout: 15000 });
-                  await page.waitForTimeout(2000);  // 反反爬延迟
-                
-                  const value = await page.$eval(
-                    source.selector,
-                    source.handler
-                  );
-                
-                  if (value && !isNaN(value)) {
-                    console.log(`数据源 ${source.name} 成功获取: ${value}`);
-                    finalValue = value;
-                    break;
-                  }
-                } catch (err) {
-                  console.log(`数据源 ${source.name} 失败: ${err.message}`);
-                }
-              }
-
-              if (finalValue !== null) {
-                console.log(`::set-output name=ahr999_value::${finalValue}`);
-              } else {
-                throw new Error('所有数据源均不可用');
-              }
-
-            } catch (error) {
-              console.log(`::error:: 全局错误 - ${error.message}`);
-              process.exit(2);  // 特殊退出码标识
-            } finally {
-              await browser.close();
-            }
-          })();
-
-    # ========== 智能通知系统 ==========
-    - name: 风险控制中心
-      if: |
-        always() && 
-        (steps.crawler.outcome == 'success' || steps.crawler.outcome == 'failure')
+    - name: 数据抓取
+      id: crawler
       run: |
-        # 状态码解析
-        if [ "${{ steps.crawler.outcome }}" = "failure" ]; then
-          echo "::warning:: 数据抓取服务异常！"
-          python3 -c "
-          import smtplib, os
-          from email.mime.text import MIMEText
+        node <<EOF
+        const puppeteer = require('puppeteer');
+        (async () => {
+          const browser = await puppeteer.launch({
+            executablePath: '/usr/bin/chromium-browser',
+            args: [
+              '--no-sandbox',
+              '--disable-setuid-sandbox',
+              '--disable-dev-shm-usage'
+            ]
+          });
         
-          msg = MIMEText('监控系统故障，请及时检查！', 'plain', 'utf-8')
-          msg['Subject'] = '🚨 监控系统告警'
-          msg['From'] = os.environ['SMTP_USER']
-          msg['To'] = os.environ['RECEIVER_EMAIL']
-        
-          with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
-              server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
-              server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], msg.as_string())
-          "
-        elif [ "${{ steps.crawler.outputs.ahr999_value }}" ]; then
-          # 正常处理流程
-          VALUE=${{ steps.crawler.outputs.ahr999_value }}
-          # 分级策略...
-        fi
+          try {
+            const page = await browser.newPage();
+            await page.goto('https://www.feixiaohao.com/data/ahrdata.html', {
+              waitUntil: 'networkidle2',
+              timeout: 60000
+            });
+          
+            // 精准元素定位
+            const value = await page.evaluate(() => {
+              const element = document.querySelector('div.price-box > div.val');
+              return element ? parseFloat(element.textContent.replace(/[^\d.]/g, '')) : null;
+            });
+          
+            console.log(`::set-output name=ahr999_value::${value}`);
+          } finally {
+            await browser.close();
+          }
+        })();
+        EOF
+
+    - name: 发送提醒
+      if: |
+        steps.crawler.outputs.ahr999_value != '' &&
+        (steps.crawler.outputs.ahr999_value <= 0.8 || steps.crawler.outputs.ahr999_value >= 1.2)
       env:
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+      run: |
+        python3 -c "
+        import smtplib, os
+        from email.mime.text import MIMEText
+      
+        value = ${{ steps.crawler.outputs.ahr999_value }}
+        if value <= 0.5:
+            msg = '🚨 极度低估！Ahr999指数：{:.4f}'.format(value)
+        elif value <= 0.8:
+            msg = '🚩 中度低估！Ahr999指数：{:.4f}'.format(value)
+        else:
+            msg = '⚠️ 风险预警！Ahr999指数：{:.4f}'.format(value)
+      
+        message = MIMEText(msg, 'plain', 'utf-8')
+        message['Subject'] = 'Ahr999监控提醒'
+        message['From'] = os.environ['SMTP_USER']
+        message['To'] = os.environ['RECEIVER_EMAIL']
+      
+        with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
+            server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+            server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], message.as_string())
+        "
