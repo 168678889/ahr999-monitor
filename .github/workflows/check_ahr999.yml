@@ -1,91 +1,124 @@
-name: Ahr999页面监控
+name: Ahr999智能监控系统
 on:
   schedule:
-    - cron: '*/15 * * * *'  # 每15分钟检测（降低封禁风险）
-  workflow_dispatch:        # 手动触发调试
+    - cron: '*/15 * * * *'  # 每15分钟检测，平衡频率与稳定性
+  workflow_dispatch:        # 支持手动触发
 
 jobs:
-  monitor:
+  ahr999-monitor:
     runs-on: ubuntu-latest
     steps:
-    - name: 安装浏览器环境
+    # ========== 环境准备 ==========
+    - name: 安装系统依赖
       run: |
         sudo apt-get update
-        sudo apt-get install -y chromium-browser
+        sudo apt-get install -y \
+          libgbm-dev \
+          libxshmfence-dev \
+          libasound2 \
+          libnss3 \
+          libatk1.0-0
       
-    - name: 动态抓取数据
-      id: get-data
+    # ========== 数据抓取模块 ==========
+    - name: 动态页面抓取
+      id: data-crawler
       uses: browser-actions/setup-puppeteer@v1.2.0
       with:
         args: |
           const puppeteer = require('puppeteer');
           (async () => {
-            const browser = await puppeteer.launch({ 
-              headless: true,
-              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            // 浏览器配置（防崩溃优化）
+            const browser = await puppeteer.launch({
+              headless: 'new',  // 新版无头模式
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--single-process'
+              ],
+              timeout: 60000
             });
-            const page = await browser.newPage();
-          
-            // 伪装正常浏览器访问
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-          
+
             try {
-              // 主数据源：飞小号页面
-              await page.goto('https://www.feixiaohao.com/data/ahrdata.html', {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-              });
-              await page.waitForSelector('.val', { timeout: 15000 });
-              await page.waitForTimeout(2000);  // 等待数值稳定
+              const page = await browser.newPage();
             
-              const value = await page.$eval('.val', el => {
-                const text = el.textContent.trim();
-                return parseFloat(text) || null;
+              // 反反爬策略：模拟真实浏览器
+              await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+              await page.setExtraHTTPHeaders({
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Referer': 'https://www.feixiaohao.com/'
               });
-            
-              // 备用数据源：Ahr999.com
-              if (value === null) {
-                await page.goto('https://ahr999.com', { waitUntil: 'networkidle2' });
-                const backupValue = await page.$eval('#current_value', el => parseFloat(el.textContent));
-                console.log(`::set-output name=ahr999::${backupValue}`);
-              } else {
-                console.log(`::set-output name=ahr999::${value}`);
+
+              // ===== 主数据源：飞小号页面 =====
+              let value = null;
+              try {
+                await page.goto('https://www.feixiaohao.com/data/ahrdata.html', {
+                  waitUntil: 'networkidle2',
+                  timeout: 45000
+                });
+                await page.waitForSelector('div.val', { timeout: 20000 });
+                await page.waitForTimeout(3000);  // 等待数据稳定
+              
+                value = await page.$eval('div.val', el => {
+                  return parseFloat(el.textContent.replace(/[^0-9.]/g, '')) || null;
+                });
+              } catch (primaryError) {
+                console.log('主数据源失败，切换备用源');
               }
+
+              // ===== 备用数据源：Ahr999官方 =====
+              if (value === null) {
+                await page.goto('https://ahr999.com', {
+                  waitUntil: 'domcontentloaded',
+                  timeout: 30000
+                });
+                value = await page.$eval('#current_value', el => 
+                  parseFloat(el.textContent.match(/\d+\.?\d*/)[0])
+                );
+              }
+
+              console.log(`::set-output name=ahr999_value::${value}`);
             
             } catch (error) {
-              console.log('::error:: 数据抓取失败');
-              console.log(`::set-output name=ahr999::error`);
+              console.log(`::error:: 全局捕获 - ${error.message}`);
+              console.log('::set-output name=ahr999_value::error');
             } finally {
               await browser.close();
             }
           })();
 
-    - name: 智能提醒
+    # ========== 智能提醒模块 ==========
+    - name: 分级警报系统
       if: |
-        steps.get-data.outputs.ahr999 != 'error' && 
-        (steps.get-data.outputs.ahr999 <= 0.8 || steps.get-data.outputs.ahr999 >= 1.2)
+        steps.data-crawler.outputs.ahr999_value != 'error' &&
+        (steps.data-crawler.outputs.ahr999_value <= 0.8 || steps.data-crawler.outputs.ahr999_value >= 1.2)
       env:
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
         RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
       run: |
-        VALUE=$(echo "${{ steps.get-data.outputs.ahr999 }}" | bc -l)
-      
-        # 分级提醒策略
+        # 数值格式化
+        VALUE=$(printf "%.4f" ${{ steps.data-crawler.outputs.ahr999_value }})
+
+        # 分级策略
         if (( $(echo "$VALUE <= 0.5" | bc -l) )); then
-          MSG="🔥 极度低估！Ahr999=$VALUE，建议立即抄底"
+          TITLE="🚨 极度低估 (Ahr999=$VALUE)"
+          CONTENT="【紧急抄底】当前指数已进入历史底部区域（<0.5），推荐策略：\n1. 使用50%备用金立即买入\n2. 剩余资金分3批挂单（0.45/0.4/0.35）\n3. 结合MVRV-Z <0验证信号"
         elif (( $(echo "$VALUE <= 0.8" | bc -l) )); then
-          MSG="🚩 中度低估！Ahr999=$VALUE，建议分批建仓"
+          TITLE="🚩 中度低估 (Ahr999=$VALUE)"
+          CONTENT="【定投时机】当前进入定投区间（0.5-0.8），推荐策略：\n1. 启动周定投计划\n2. 每下跌0.1增加20%仓位\n3. 设置止损线0.45"
         elif (( $(echo "$VALUE >= 1.2" | bc -l) )); then
-          MSG="⚠️ 进入高估！Ahr999=$VALUE，建议逐步减仓"
+          TITLE="⚠️ 风险区域 (Ahr999=$VALUE)"
+          CONTENT="【止盈预警】当前进入高风险区域（>1.2），推荐策略：\n1. 分批卖出（30%/50%/20%）\n2. 保留10%底仓观望\n3. 当Ahr999x<0.3时清仓"
         fi
-      
+
+        # 发送邮件
         python3 -c "
         import smtplib, os
         from email.mime.text import MIMEText
       
-        msg = MIMEText(os.environ['MSG'], 'plain', 'utf-8')
-        msg['Subject'] = 'Ahr999指数警报'
+        msg = MIMEText(os.environ['CONTENT'], 'plain', 'utf-8')
+        msg['Subject'] = os.environ['TITLE']
         msg['From'] = os.environ['SMTP_USER']
         msg['To'] = os.environ['RECEIVER_EMAIL']
       
@@ -94,4 +127,5 @@ jobs:
             server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], msg.as_string())
         "
       env:
-        MSG: ${{ env.MSG }}
+        TITLE: ${{ env.TITLE }}
+        CONTENT: ${{ env.CONTENT }}
