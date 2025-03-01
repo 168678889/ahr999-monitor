@@ -1,135 +1,78 @@
-name: 非小号Ahr999监控系统
+name: Ahr999自计算监控
 on:
   schedule:
-    - cron: '45 * * * *'  # 每小时第45分钟运行
+    - cron: '0 */2 * * *'  # 每2小时运行一次
   workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-    # ========== 浏览器环境配置 ==========
-    - name: 安装系统依赖
+    # ========== 数据获取 ==========
+    - name: 获取比特币价格
+      id: get-price
       run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          chromium-browser \
-          libnss3 \
-          libx11-xcb1 \
-          libxcomposite1 \
-          libxcursor1 \
-          libxdamage1 \
-          libxi6 \
-          libxtst6 \
-          libxrandr2 \
-          libasound2 \
-          libatk1.0-0 \
-          libgtk-3-0 \
-          libgbm1
+        PRICE=$(curl -s "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd" | jq -r '.bitcoin.usd')
+        echo "price=$PRICE" >> $GITHUB_OUTPUT
 
-    # ========== 数据抓取模块 ==========
-    - name: 抓取非小号数据
-      id: feixiaohao-crawler
+    - name: 获取S2F数据
+      id: get-s2f
       run: |
-        node <<EOF
-        const fs = require('fs');
-        const puppeteer = require('puppeteer');
+        # Glassnode S2F API (需注册获取API_KEY)
+        # S2F=$(curl -s -X GET "https://api.glassnode.com/v1/metrics/indicators/sopr" -H "X-Api-Key:${{ secrets.GLASSNODE_API_KEY }}" | jq '.[-1].v')
+      
+        # 备用S2F计算（基于链上数据估算）
+        BLOCKS_PER_YEAR=52560  # 每年区块数
+        CURRENT_BLOCK_HEIGHT=$(curl -s https://blockchain.info/q/getblockcount)
+        TOTAL_BTC=$(curl -s https://blockchain.info/q/totalbc | awk '{print $1/100000000}')
+        YEARLY_ISSUANCE=$(echo "50*6*24*365 / 100000000" | bc -l)
+        S2F=$(echo "$TOTAL_BTC / $YEARLY_ISSUANCE" | bc -l)
+        echo "s2f=$S2F" >> $GITHUB_OUTPUT
 
-        async function fetchDataWithRetry(page, url, selector, retries = 3) {
-          for (let i = 0; i < retries; i++) {
-            try {
-              await page.goto(url, {
-                waitUntil: 'networkidle2',
-                timeout: 60000
-              });
-              await page.waitForSelector(selector, { timeout: 15000 });
-              const value = await page.\$eval(selector, el => {
-                return parseFloat(el.textContent.replace(/[^0-9.]/g, ''));
-              });
-              if (!isNaN(value)) return value;
-            } catch (e) {
-              console.log(\`第\${i+1}次尝试失败: \${e.message}\`);
-              await page.waitForTimeout(5000);  // 重试前等待
-            }
-          }
-          return null;
-        }
+    # ========== 计算Ahr999指数 ==========
+    - name: 计算指数
+      id: calculate
+      run: |
+        # 获取200周平均价（使用CoinGecko历史数据）
+        START_DATE=$(date -d "200 weeks ago" +%s)
+        END_DATE=$(date +%s)
+        HISTORIC_PRICES=$(curl -s "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range?vs_currency=usd&from=$START_DATE&to=$END_DATE" | jq -r '.prices[][1]')
+        AVG_PRICE=$(echo "$HISTORIC_PRICES" | awk '{sum+=$1} END {print sum/NR}')
 
-        (async () => {
-          try {
-            const browser = await puppeteer.launch({
-              executablePath: '/usr/bin/chromium-browser',
-              args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled'
-              ],
-              headless: 'new'
-            });
+        # 计算公式
+        PRICE=${{ steps.get-price.outputs.price }}
+        S2F_VALUE=${{ steps.get-s2f.outputs.s2f}}
+        AHR999=$(echo "scale=4; $PRICE / (0.45 * $AVG_PRICE + 0.55 * $S2F_VALUE)" | bc -l)
+        echo "ahr999=$AHR999" >> $GITHUB_OUTPUT
 
-            const page = await browser.newPage();
-          
-            // 反爬策略
-            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
-            await page.setExtraHTTPHeaders({
-              'Accept-Language': 'zh-CN,zh;q=0.9'
-            });
-
-            // 获取数据 (带重试机制)
-            const value = await fetchDataWithRetry(
-              page,
-              'https://www.feixiaohao.com/data/ahrdata.html',
-              'div.price-box > div.val'
-            ) || await fetchDataWithRetry(
-              page,
-              'https://www.feixiaohao.com/data/ahrdata.html',
-              'div.coin-price > span.val'
-            );
-
-            // 写入输出
-            fs.appendFileSync(process.env.GITHUB_OUTPUT, \`ahr999_value=\${value}\`);
-            await browser.close();
-
-            if (value === null) {
-              console.error('所有数据源均获取失败');
-              process.exit(1);
-            }
-
-          } catch (error) {
-            console.error('全局错误:', error);
-            process.exit(1);
-          }
-        })();
-        EOF
-
-    # ========== 邮件通知模块 ==========
-    - name: 发送提醒
+    # ========== 智能提醒 ==========
+    - name: 发送邮件提醒
       if: |
-        steps.feixiaohao-crawler.outputs.ahr999_value != '' &&
-        (steps.feixiaohao-crawler.outputs.ahr999_value <= 0.8 || steps.feixiaohao-crawler.outputs.ahr999_value >= 1.2)
+        steps.calculate.outputs.ahr999 != '' &&
+        (steps.calculate.outputs.ahr999 <= 0.45 || steps.calculate.outputs.ahr999 >= 1.2)
       env:
         SMTP_USER: ${{ secrets.SMTP_USER }}
         SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        RECEIVER: ${{ secrets.RECEIVER_EMAIL }}
       run: |
         python3 -c "
         import smtplib, os
         from email.mime.text import MIMEText
       
-        value = ${{ steps.feixiaohao-crawler.outputs.ahr999_value }}
-        msg = MIMEText(f'当前Ahr999指数：{value:.4f}', 'plain', 'utf-8')
-        msg['Subject'] = '非小号监控提醒'
-        msg['From'] = os.environ['SMTP_USER']
-        msg['To'] = os.environ['RECEIVER_EMAIL']
+        ahr999 = ${{ steps.calculate.outputs.ahr999 }}
+        msg = f'''Ahr999自计算结果：{ahr999:.4f}
+        输入参数：
+        - 当前价格：${{ steps.get-price.outputs.price }}$
+        - S2F值：${{ steps.get-s2f.outputs.s2f }}
+        - 200周均价：${{ steps.calculate.outputs.avg_price }}$
+        '''
       
-        try:
-            with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
-                server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
-                server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], msg.as_string())
-            print('邮件发送成功')
-        except Exception as e:
-            print(f'邮件发送失败: {str(e)}')
-            exit(1)
+        mime = MIMEText(msg, 'plain', 'utf-8')
+        mime['Subject'] = 'Ahr999指数警报' if ahr999 >=1.2 else '抄底机会提醒'
+        mime['From'] = os.environ['SMTP_USER']
+        mime['To'] = os.environ['RECEIVER']
+      
+        with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
+            server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+            server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER']], mime.as_string())
         "
