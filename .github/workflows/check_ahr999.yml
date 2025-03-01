@@ -1,60 +1,97 @@
-name: Ahr999 Mail Alert
+name: Ahr999页面监控
 on:
   schedule:
-    - cron: '*/5 * * * *'  # 每5分钟检测一次
+    - cron: '*/15 * * * *'  # 每15分钟检测（降低封禁风险）
+  workflow_dispatch:        # 手动触发调试
 
 jobs:
-  check:
+  monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装Python依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pip
-          pip3 install requests python-dotenv
+    - name: 安装浏览器环境
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y chromium-browser
+      
+    - name: 动态抓取数据
+      id: get-data
+      uses: browser-actions/setup-puppeteer@v1.2.0
+      with:
+        args: |
+          const puppeteer = require('puppeteer');
+          (async () => {
+            const browser = await puppeteer.launch({ 
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+            const page = await browser.newPage();
+          
+            // 伪装正常浏览器访问
+            await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36');
+          
+            try {
+              // 主数据源：飞小号页面
+              await page.goto('https://www.feixiaohao.com/data/ahrdata.html', {
+                waitUntil: 'networkidle2',
+                timeout: 30000
+              });
+              await page.waitForSelector('.val', { timeout: 15000 });
+              await page.waitForTimeout(2000);  // 等待数值稳定
+            
+              const value = await page.$eval('.val', el => {
+                const text = el.textContent.trim();
+                return parseFloat(text) || null;
+              });
+            
+              // 备用数据源：Ahr999.com
+              if (value === null) {
+                await page.goto('https://ahr999.com', { waitUntil: 'networkidle2' });
+                const backupValue = await page.$eval('#current_value', el => parseFloat(el.textContent));
+                console.log(`::set-output name=ahr999::${backupValue}`);
+              } else {
+                console.log(`::set-output name=ahr999::${value}`);
+              }
+            
+            } catch (error) {
+              console.log('::error:: 数据抓取失败');
+              console.log(`::set-output name=ahr999::error`);
+            } finally {
+              await browser.close();
+            }
+          })();
 
-      - name: 创建监控脚本
-        run: |
-          cat <<EOF > send_mail.py
-          import smtplib
-          import os
-          import requests
-          from email.mime.text import MIMEText
-
-          # 获取Ahr999数据
-          ahr999_url = "https://api.feixiaohao.com/v3/indices/ahr999"
-          data = requests.get(ahr999_url).json()
-          current_value = data['current_value']
-
-          # 判断阈值
-          if current_value < 0.7:
-              msg = "【抄底信号】Ahr999指数已降至 {}".format(current_value)
-          elif current_value > 1.2:
-              msg = "【风险预警】Ahr999指数已升至 {}".format(current_value)
-          else:
-              exit()  # 无需发送邮件
-
-          # 配置QQ邮箱SMTP
-          smtp_host = 'smtp.qq.com'
-          smtp_port = 465
-          sender = os.environ['SMTP_USER']
-          password = os.environ['SMTP_PASSWORD']
-          receiver = os.environ['RECEIVER_EMAIL']
-
-          # 发送邮件
-          message = MIMEText(msg, 'plain', 'utf-8')
-          message['Subject'] = 'Ahr999指数监控提醒'
-          message['From'] = sender
-          message['To'] = receiver
-
-          with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
-              server.login(sender, password)
-              server.sendmail(sender, [receiver], message.as_string())
-          EOF
-
-      - name: 执行脚本
-        env:
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
-        run: python3 send_mail.py
+    - name: 智能提醒
+      if: |
+        steps.get-data.outputs.ahr999 != 'error' && 
+        (steps.get-data.outputs.ahr999 <= 0.8 || steps.get-data.outputs.ahr999 >= 1.2)
+      env:
+        SMTP_USER: ${{ secrets.SMTP_USER }}
+        SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+        RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+      run: |
+        VALUE=$(echo "${{ steps.get-data.outputs.ahr999 }}" | bc -l)
+      
+        # 分级提醒策略
+        if (( $(echo "$VALUE <= 0.5" | bc -l) )); then
+          MSG="🔥 极度低估！Ahr999=$VALUE，建议立即抄底"
+        elif (( $(echo "$VALUE <= 0.8" | bc -l) )); then
+          MSG="🚩 中度低估！Ahr999=$VALUE，建议分批建仓"
+        elif (( $(echo "$VALUE >= 1.2" | bc -l) )); then
+          MSG="⚠️ 进入高估！Ahr999=$VALUE，建议逐步减仓"
+        fi
+      
+        python3 -c "
+        import smtplib, os
+        from email.mime.text import MIMEText
+      
+        msg = MIMEText(os.environ['MSG'], 'plain', 'utf-8')
+        msg['Subject'] = 'Ahr999指数警报'
+        msg['From'] = os.environ['SMTP_USER']
+        msg['To'] = os.environ['RECEIVER_EMAIL']
+      
+        with smtplib.SMTP_SSL('smtp.qq.com', 465) as server:
+            server.login(os.environ['SMTP_USER'], os.environ['SMTP_PASSWORD'])
+            server.sendmail(os.environ['SMTP_USER'], [os.environ['RECEIVER_EMAIL']], msg.as_string())
+        "
+      env:
+        MSG: ${{ env.MSG }}
