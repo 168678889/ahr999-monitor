@@ -1,0 +1,60 @@
+name: Ahr999 Mail Alert
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # 每5分钟检测一次
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 安装Python依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          pip3 install requests python-dotenv
+
+      - name: 创建监控脚本
+        run: |
+          cat <<EOF > send_mail.py
+          import smtplib
+          import os
+          import requests
+          from email.mime.text import MIMEText
+
+          # 获取Ahr999数据
+          ahr999_url = "https://api.feixiaohao.com/v3/indices/ahr999"
+          data = requests.get(ahr999_url).json()
+          current_value = data['current_value']
+
+          # 判断阈值
+          if current_value < 0.7:
+              msg = "【抄底信号】Ahr999指数已降至 {}".format(current_value)
+          elif current_value > 1.2:
+              msg = "【风险预警】Ahr999指数已升至 {}".format(current_value)
+          else:
+              exit()  # 无需发送邮件
+
+          # 配置QQ邮箱SMTP
+          smtp_host = 'smtp.qq.com'
+          smtp_port = 465
+          sender = os.environ['SMTP_USER']
+          password = os.environ['SMTP_PASSWORD']
+          receiver = os.environ['RECEIVER_EMAIL']
+
+          # 发送邮件
+          message = MIMEText(msg, 'plain', 'utf-8')
+          message['Subject'] = 'Ahr999指数监控提醒'
+          message['From'] = sender
+          message['To'] = receiver
+
+          with smtplib.SMTP_SSL(smtp_host, smtp_port) as server:
+              server.login(sender, password)
+              server.sendmail(sender, [receiver], message.as_string())
+          EOF
+
+      - name: 执行脚本
+        env:
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          RECEIVER_EMAIL: ${{ secrets.RECEIVER_EMAIL }}
+        run: python3 send_mail.py
